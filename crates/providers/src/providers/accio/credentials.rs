@@ -45,6 +45,18 @@ pub struct Credentials {
     pub name: String,
     /// 推理请求的设备指纹（本网关按账号生成）
     pub device_id: String,
+    /// **公司空间**（团队）标识。空串 = 个人空间。
+    ///
+    /// ── 它是什么（2026-10 实测）──────────────────────────────────
+    /// Accio 企业版在同一个账号下分「个人空间 / 公司空间」，两者的积分是**两个
+    /// 独立的池**。空间不是另一条端点、也不换 token，而是**推理请求上的
+    /// `x-team-id` 头**：带上就花公司池，不带就是个人池。
+    ///
+    /// 取值是**纯团队号**（如 `37001`），来自上游 `POST /api/team/queryUserTeams`
+    /// （或桌面端 `~/.accio/state/current-space.json` 的 `teamId`）。
+    pub team_id: String,
+    /// 空间名（仅展示用，例如「蒂万坦斯」）
+    pub team_name: String,
 }
 
 impl Credentials {
@@ -74,6 +86,8 @@ impl Credentials {
             email: text(payload, &["email"]).chars().take(320).collect(),
             name: text(payload, &["nickname", "name"]).chars().take(100).collect(),
             device_id: text(payload, &["deviceId", "device_id"]),
+            team_id: text(payload, &["teamId", "team_id"]),
+            team_name: text(payload, &["teamName", "team_name"]).chars().take(100).collect(),
         })
     }
 
@@ -88,6 +102,11 @@ impl Credentials {
         if self.device_id.is_empty() {
             self.device_id = format!("desktop-{}", new_request_id().replace('-', ""));
         }
+    }
+
+    /// 是否绑定了公司空间（有 teamId 才算）
+    pub fn is_team(&self) -> bool {
+        !self.team_id.trim().is_empty()
     }
 
     /// 有刷新凭证 + 有到期时间，且快到点了
@@ -117,6 +136,8 @@ impl Credentials {
             "email": text_or_null(&self.email),
             "nickname": text_or_null(&self.name),
             "deviceId": text_or_null(&self.device_id),
+            "teamId": text_or_null(&self.team_id),
+            "teamName": text_or_null(&self.team_name),
         })
     }
 }

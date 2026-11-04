@@ -167,6 +167,63 @@ fn parse_usage(usage: &Value) -> Value {
     usage
 }
 
+/// 从 `raw_response_json` 里捞出 function_call 的 id（按出现顺序，带名字）。
+///
+/// ── 为什么必须捞（2026-11 实测）─────────────────────────────
+/// 上游 ADK 帧里**外层** `function_call` part 只有 `name` 与 `args_json`，没有
+/// `id`；真正的调用 id 藏在 `raw_response_json.candidates[].content.parts[]
+/// .functionCall.id`（实测形如 `call_1591653`）。不取它，客户端拿到的工具调用
+/// 就没有稳定 id，后续 tool 消息的 `tool_call_id` 对不上，客户端会拒绝继续：
+/// `tool/result at seq N requires toolCallId matching its tool source`。
+fn raw_call_ids(value: &Value) -> Vec<(String, String)> {
+    let Some(raw) = value.get("raw_response_json").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    let Ok(parsed) = serde_json::from_str::<Value>(raw) else {
+        return Vec::new();
+    };
+    let Some(candidates) = parsed.get("candidates").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, String)> = Vec::new();
+    for candidate in candidates {
+        let Some(parts) = candidate
+            .get("content")
+            .and_then(|content| content.get("parts"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for part in parts {
+            let Some(call) = part.get("functionCall").or_else(|| part.get("function_call")) else {
+                continue;
+            };
+            let id = text_field(call, "id", "id");
+            if id.is_empty() {
+                continue;
+            }
+            out.push((text_field(call, "name", "name"), id));
+        }
+    }
+    out
+}
+
+/// 按顺序（优先同名）取下一个 id，并推进游标。
+fn take_call_id(ids: &[(String, String)], name: &str, cursor: &mut usize) -> Option<String> {
+    for index in *cursor..ids.len() {
+        if ids[index].0 == name {
+            *cursor = index + 1;
+            return Some(ids[index].1.clone());
+        }
+    }
+    if *cursor < ids.len() {
+        let id = ids[*cursor].1.clone();
+        *cursor += 1;
+        return Some(id);
+    }
+    None
+}
+
 /// 一帧 `data:` 的 JSON 文本 → [`Frame`]。
 ///
 /// 解析失败返回 None（非 JSON 的心跳帧、`[DONE]` 之外的控制帧都按「无内容」跳过，
@@ -192,8 +249,19 @@ pub fn parse_frame(data: &str) -> Option<Frame> {
     }
     if let Some(content) = object.get("content") {
         if let Some(parts) = content.get("parts").and_then(Value::as_array) {
+            // 外层 part 不带 id（见 `raw_call_ids`），按 raw_response_json 的顺序补回
+            let ids = raw_call_ids(&value);
+            let mut cursor = 0usize;
             for part in parts {
-                frame.parts.push(parse_part(part));
+                let mut parsed = parse_part(part);
+                if let Part::FunctionCall { id, name, .. } = &mut parsed {
+                    if id.is_empty() {
+                        if let Some(found) = take_call_id(&ids, name, &mut cursor) {
+                            *id = found;
+                        }
+                    }
+                }
+                frame.parts.push(parsed);
             }
         }
     }
@@ -361,6 +429,9 @@ pub struct Translator {
     reasoning: String,
     /// 收到过任何工具调用（决定收尾的 finish_reason 是 tool_calls 还是 stop）
     saw_tool_call: bool,
+    /// 上游连 id 都不给时，用来造**本轮唯一**调用 id 的盐（每条回复一个）。
+    /// 只按序号造（`call_0`）会让不同轮次撞 id，客户端按 id 配对就会配错。
+    call_salt: String,
 }
 
 impl Translator {
@@ -376,6 +447,11 @@ impl Translator {
             content: String::new(),
             reasoning: String::new(),
             saw_tool_call: false,
+            call_salt: crate::ids::new_conversation_id()
+                .replace('-', "")
+                .chars()
+                .take(8)
+                .collect(),
         }
     }
 
@@ -410,7 +486,7 @@ impl Translator {
                     }
                 }
                 Part::FunctionCall { id, name, args } => {
-                    let index = self.accumulate_call(id, name, args);
+                    let (index, contributed) = self.accumulate_call(id, name, args);
                     // 先取快照再改标记：借用与可变借用分开，避免交叉持有
                     let (announce, call_id, call_name, call_args) = match self.tool_state.get(index as usize) {
                         Some(entry) => (!entry.announced, entry.id.clone(), entry.name.clone(), entry.args.clone()),
@@ -423,7 +499,9 @@ impl Translator {
                         entry.announced = true;
                     }
                     // 首次具名声明携带已缓冲的参数，后续只下发新增参数。
-                    if announce || !args.is_empty() {
+                    // `contributed` 为 false = 上游把同一段参数又发了一遍（回声），
+                    // 不能再下发一次：客户端按片段拼接 arguments，重复会拼成非法 JSON。
+                    if announce || (contributed && !args.is_empty()) {
                         self.saw_tool_call = true;
                         out.push(Delta::ToolCall {
                             index,
@@ -446,38 +524,61 @@ impl Translator {
     /// 多个 part 各带一段）。但也可能一次给全（多个同名调用的完整 JSON）。
     /// 判据：**已有内容仍是合法 JSON 且新来的也是完整 JSON → 那是新调用**；
     /// 否则按续写拼上去。这样两种形态都能正确聚合（详见模块头要点 2）。
-    fn accumulate_call(&mut self, id: &str, name: &str, args: &str) -> i64 {
-        let can_extend = self.tool_state.last().is_some_and(|entry| {
-            if !id.is_empty() && !entry.id.is_empty() && id != entry.id {
-                return false;
-            }
-            if !name.is_empty() && !entry.name.is_empty() && name != entry.name {
-                return false;
-            }
-            // 已有内容是完整 JSON 且新片段也完整 → 不是续写
-            let previous_complete = !entry.args.is_empty() && serde_json::from_str::<Value>(&entry.args).is_ok();
-            let incoming_complete = !args.is_empty() && serde_json::from_str::<Value>(args).is_ok();
-            !(previous_complete && incoming_complete)
-        });
-        if can_extend {
-            if let Some(entry) = self.tool_state.last_mut() {
-                if entry.id.is_empty() && !id.is_empty() {
-                    entry.id = id.to_string();
+    /// 返回 `(index, 是否贡献了新内容)`；`false` = 这一 part 是上游重放的回声。
+    fn accumulate_call(&mut self, id: &str, name: &str, args: &str) -> (i64, bool) {
+        // ① 有 id：按 id 认调用（同 id 的后续片段 / 整段重放都落这里）
+        if !id.is_empty() {
+            if let Some(index) = self.tool_state.iter().position(|entry| entry.id == id) {
+                let entry = &mut self.tool_state[index];
+                if !args.is_empty() && entry.args == args {
+                    return (index as i64, false);
+                }
+                let previous_complete =
+                    !entry.args.is_empty() && serde_json::from_str::<Value>(&entry.args).is_ok();
+                let incoming_complete = !args.is_empty() && serde_json::from_str::<Value>(args).is_ok();
+                // 同 id 又被整段重发（实测上游会重放整组调用）→ 不回放
+                if previous_complete && incoming_complete {
+                    return (index as i64, false);
                 }
                 if entry.name.is_empty() && !name.is_empty() {
                     entry.name = name.to_string();
                 }
                 entry.args.push_str(args);
-                return (self.tool_state.len() - 1) as i64;
+                return (index as i64, true);
             }
         }
+        // ② 无 id：参数与已有某条一模一样 = 同一调用的回声（重放时可能丢 id）
+        if !args.is_empty() {
+            if let Some(index) = self
+                .tool_state
+                .iter()
+                .position(|entry| entry.name == name && entry.args == args)
+            {
+                return (index as i64, false);
+            }
+        }
+        // ③ 无 id 且参数不完整：并进最后一条同名调用（分片到达）
+        let incoming_complete = !args.is_empty() && serde_json::from_str::<Value>(args).is_ok();
+        if !incoming_complete && !name.is_empty() {
+            if let Some(index) = self.tool_state.iter().rposition(|entry| entry.name == name) {
+                self.tool_state[index].args.push_str(args);
+                return (index as i64, true);
+            }
+        }
+        // ④ 新调用。缺 id 就造一个本轮唯一的：`call_<盐><序号>`
+        let index = self.tool_state.len();
+        let resolved_id = if id.is_empty() {
+            format!("call_{}{}", self.call_salt, index)
+        } else {
+            id.to_string()
+        };
         self.tool_state.push(ToolAccum {
-            id: id.to_string(),
+            id: resolved_id,
             name: name.to_string(),
             args: args.to_string(),
             announced: false,
         });
-        (self.tool_state.len() - 1) as i64
+        (index as i64, true)
     }
 
     /// 流式的 role 帧是否该发（第一次产出 delta 前补一帧 role）

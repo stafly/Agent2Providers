@@ -137,6 +137,10 @@ pub fn build_plan(
         headers.push(("utdid".to_string(), credentials.device_id.clone()));
     }
     headers.push(("version".to_string(), endpoints::DEFAULT_APP_VERSION.to_string()));
+    // 公司空间：带了 `x-team-id` 就花公司积分池，不带就是个人池。
+    // 空间不换 token、不换端点，只是这一个头（见 `endpoints::push_team_header`）。
+    let team_id = credentials.is_team().then_some(credentials.team_id.as_str());
+    endpoints::push_team_header(&mut headers, team_id);
 
     let body_bytes = serde_json::to_vec(&built.body)
         .map_err(|_| GatewayError::with_status(500, "Accio 请求体序列化失败"))?;

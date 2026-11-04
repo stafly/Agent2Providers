@@ -208,6 +208,8 @@ pub async fn exchange_code(
         email: String::new(),
         name: String::new(),
         device_id: String::new(),
+        team_id: String::new(),
+        team_name: String::new(),
     };
     credentials.ensure_identity();
     // 换回来的 token 是不透明串，账号标识只能靠资料接口问一次
