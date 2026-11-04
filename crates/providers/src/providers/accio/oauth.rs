@@ -211,6 +211,8 @@ pub async fn exchange_code(
         // 桌面端的换码响应里带 `sgcookie`（浏览器会话的伴随标识）：
         // 推理请求有就带上，更接近真实客户端
         sgcookie: credentials::sgcookie(&data),
+        team_id: String::new(),
+        team_name: String::new(),
     };
     credentials.ensure_identity();
     // 换回来的 token 是不透明串，账号标识只能靠资料接口问一次

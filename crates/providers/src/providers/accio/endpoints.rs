@@ -65,8 +65,27 @@ pub const MODEL_CONFIG_PATH_V2: &str = "/api/llm/config/v2";
 /// OAuth 客户端 id（桌面端常量；两地逐字相同）
 pub const CLIENT_ID: &str = "accio-work";
 
-/// ADK 推理请求的租户（桌面端默认值 `ADK_TENANT || "accio-agent"`）
-pub const DEFAULT_TENANT: &str = "accio-agent";
+/// ADK 推理请求的租户（`ACCIO_TENANT` 可覆盖；**缺省空串**）。
+///
+/// ── 为什么缺省不是 `accio-agent`（2026-10 实测，会封掉部分模型）──────
+/// 写死成 `accio-agent` 时，上游对一部分模型回
+/// `IAI ERR: tenant=accio-agent no permission to access model=gemini-4-argon`
+/// （HTTP 200 + 帧内 error_code 505）。桌面端发的是**空串**（`ADK_TENANT`
+/// 未设即 `""`，上游按 token 解析租户）；同一账号同一 token 只换这个字段，
+/// Gemini 4 Argon 立刻正常出流，DeepSeek 等原本可用的模型不受影响。
+pub fn tenant() -> String {
+    env_text("ACCIO_TENANT").unwrap_or_default()
+}
+
+/// 公司空间标识头 `x-team-id`（空 → 个人空间，**绝不发空值**）。
+///
+/// 空间不是另一条端点、也不换 token，只是推理请求上的这个头：带了花公司池。
+/// 取值是纯团队号（`37001`），来自 `POST /api/team/queryUserTeams`。
+pub fn push_team_header(headers: &mut Vec<(String, String)>, team_id: Option<&str>) {
+    if let Some(team) = team_id.map(str::trim).filter(|value| !value.is_empty()) {
+        headers.push(("x-team-id".to_string(), team.to_string()));
+    }
+}
 /// ADK 推理请求的来源标记（桌面端默认值 `ADK_IAI_TAG || "phoenix-desktop"`）
 pub const DEFAULT_IAI_TAG: &str = "phoenix-desktop";
 /// 推理请求头里的客户端版本（桌面端取 appVersion）。

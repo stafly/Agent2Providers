@@ -223,10 +223,25 @@ fn assistant_tool_calls_parts(tool_calls: &Value) -> Vec<Value> {
         .collect()
 }
 
-/// 工具结果（role = tool）→ ADK 的 function_response part
-fn tool_result_part(message: &Value) -> Value {
+/// 工具结果（role = tool）→ ADK 的 function_response part。
+///
+/// ── `name` 必须能补上（2026-11 实测，缺了是硬 400）──────────────
+/// OpenAI 的 tool 消息里 `name` 是可选的（客户端基本不发），而 ADK 的
+/// `function_response.name` 是 **proto 必填**：缺了上游直接回
+/// `contents[N].parts[0].function_response.name: [REQUIRED_FIELD_MISSING]`，
+/// 表现为「第一轮工具调用正常、第二轮 502」。这里按 `tool_call_id` 去前面的
+/// assistant 消息里反查函数名。
+fn tool_result_part(message: &Value, call_names: &std::collections::HashMap<String, String>) -> Value {
     let id = message.get("tool_call_id").and_then(Value::as_str).unwrap_or("").to_string();
-    let name = message.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+    let mut name = message.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+    if name.is_empty() {
+        if let Some(found) = call_names.get(&id) {
+            name = found.clone();
+        }
+    }
+    if name.is_empty() {
+        name = "tool".to_string();
+    }
     let content = match message.get("content") {
         Some(Value::String(text)) => text.clone(),
         Some(other) => other.to_string(),
@@ -269,6 +284,8 @@ pub fn build_upstream_body(
     let mut contents: Vec<Value> = Vec::new();
     let mut system_parts: Vec<String> = Vec::new();
     let mut pending_parts: Vec<Value> = Vec::new();
+    // 调用 id → 函数名：tool 消息只带 id，ADK 的 function_response 要 name
+    let mut call_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let messages = body.get("messages").and_then(Value::as_array).cloned().unwrap_or_default();
 
     // ── 消息归一 ────────────────────────────────────────────────
@@ -303,16 +320,27 @@ pub fn build_upstream_body(
                 }
             }
             "tool" | "function" => {
-                pending_parts.push(tool_result_part(message));
+                pending_parts.push(tool_result_part(message, &call_names));
                 // 工具结果与下一条用户消息不合并（上游按 tool 角色识别结果）
                 push_content("tool", std::mem::take(&mut pending_parts), &mut contents);
             }
             "assistant" => {
+                // 先登记「调用 id → 函数名」，供后面的 tool 消息补 name
+                let tool_calls = message.get("tool_calls").unwrap_or(&Value::Null);
+                for call in tool_calls.as_array().into_iter().flatten() {
+                    let id = call.get("id").and_then(Value::as_str).unwrap_or("");
+                    let name = call
+                        .get("function")
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if !id.is_empty() && !name.is_empty() {
+                        call_names.insert(id.to_string(), name.to_string());
+                    }
+                }
                 let mut parts: Vec<Value> = Vec::new();
                 content_to_parts(message.get("content").unwrap_or(&Value::Null), &mut parts);
-                parts.extend(assistant_tool_calls_parts(
-                    message.get("tool_calls").unwrap_or(&Value::Null),
-                ));
+                parts.extend(assistant_tool_calls_parts(tool_calls));
                 push_content("model", parts, &mut contents);
             }
             _ => {
@@ -365,7 +393,9 @@ pub fn build_upstream_body(
     let request_id = crate::ids::new_conversation_id();
     let mut payload = Map::new();
     payload.insert("model".to_string(), Value::String(model_code.to_string()));
-    payload.insert("tenant".to_string(), Value::String(super::endpoints::DEFAULT_TENANT.to_string()));
+    // 租户**缺省留空**：上游按 token 解析；写死 `accio-agent` 会让部分模型
+    // 被判「该租户无权限」（见 `endpoints::tenant`）。
+    payload.insert("tenant".to_string(), Value::String(super::endpoints::tenant()));
     payload.insert("iai_tag".to_string(), Value::String(super::endpoints::DEFAULT_IAI_TAG.to_string()));
     payload.insert("empid".to_string(), Value::String(String::new()));
     payload.insert("request_id".to_string(), Value::String(request_id.clone()));
