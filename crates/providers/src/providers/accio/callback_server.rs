@@ -60,14 +60,35 @@ pub struct CallbackListener {
     inbox: tokio::sync::Mutex<mpsc::UnboundedReceiver<String>>,
 }
 
+/// `ACCIO_CALLBACK_PORT`：固定回调端口（容器部署用；缺省 = 随机端口 + 仅回环）。
+///
+/// 必须与宿主机发布的端口一致（`-p 127.0.0.1:<port>:<port>`），否则宿主机浏览器
+/// 依旧连不上；同一时刻只能有一轮登录占用它。
+fn callback_port() -> Option<u16> {
+    std::env::var("ACCIO_CALLBACK_PORT")
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .filter(|port| *port > 0)
+}
+
 impl CallbackListener {
     /// 绑一个空闲 loopback 端口（IPv4 必须成功；IPv6 尽力而为）。
     ///
     /// 只绑回环：回调里带着一次性授权码，不给局域网开口子。
     pub async fn bind() -> Result<Self, String> {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .map_err(|error| format!("绑定本机回调端口失败：{error}"))?;
+        // ── 容器化部署（Docker）为什么要能固定端口 ──────────────────
+        // 插件是网关的子进程，Docker 里它跑在**容器内**：`127.0.0.1:<随机端口>`
+        // 只有容器自己能连，宿主机浏览器打开就是 ERR_CONNECTION_REFUSED，
+        // 面板上表现为「一直等回调、最后超时」。
+        // 设了 `ACCIO_CALLBACK_PORT` 就绑 0.0.0.0 的固定端口，配
+        // `docker run -p 127.0.0.1:44797:44797` 宿主机上的回调才落得进来；
+        // 不设时保持原行为（回环 + 随机端口），桌面端/裸机完全不受影响。
+        let listener = match callback_port() {
+            Some(port) => TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)),
+            None => TcpListener::bind((Ipv4Addr::LOCALHOST, 0)),
+        }
+        .await
+        .map_err(|error| format!("绑定本机回调端口失败：{error}"))?;
         let port = listener
             .local_addr()
             .map_err(|error| format!("读不到回调端口：{error}"))?
@@ -82,7 +103,13 @@ impl CallbackListener {
         }
         logging::log(
             "[Login]",
-            &format!("Accio OAuth 回调已监听 127.0.0.1:{port}{CALLBACK_PATH}"),
+            &format!(
+                "Accio OAuth 回调已监听 {}:{port}{CALLBACK_PATH}",
+                match callback_port() {
+                    Some(_) => "0.0.0.0（容器部署：宿主机需 -p 发布同一端口）",
+                    None => "127.0.0.1",
+                }
+            ),
         );
         Ok(Self {
             port,
