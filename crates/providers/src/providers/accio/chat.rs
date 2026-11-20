@@ -159,10 +159,6 @@ pub async fn send(
     proxy: Option<&ResolvedProxy>,
 ) -> Result<reqwest::Response, GatewayError> {
     let client = egress::stream_client(proxy, "direct");
-    let mut builder = client.post(&plan.url).body(plan.body.clone());
-    for (key, value) in &plan.headers {
-        builder = builder.header(key, value);
-    }
     // `WireProxy` 没有 `label` 字段（网关那份有）：用完整 URL 拼一个同样
     // 可读的描述，排障时够用。
     let via = match proxy {
@@ -172,23 +168,49 @@ pub async fn send(
     let budget = std::time::Duration::from_millis(
         crate::timeouts::current().headers_ms(),
     );
-    match tokio::time::timeout(budget, builder.send()).await {
-        Ok(Ok(response)) => Ok(response),
-        Ok(Err(error)) if error.is_timeout() => Err(GatewayError::with_status(
-            502,
-            format!(
-                "Accio 连接中超时({}秒，出口 {via})",
-                crate::timeouts::current().connect_ms() / 1000
-            ),
-        )),
-        Ok(Err(error)) => Err(GatewayError::with_status(
-            502,
-            format!("Accio 上游请求失败（{via}）: {}", egress::describe_chain(&error)),
-        )),
-        Err(_elapsed) => Err(GatewayError::with_status(
-            502,
-            format!("Accio 等待响应超时({}秒，出口 {via})", budget.as_secs()),
-        )),
+    // ── 为什么只在连接阶段重试一次 ──────────────────────────────
+    // 实测上游偶发 `tls handshake eof`（两周 3 次，见 2026-11-05/11-18/11-20），
+    // 全部发生在**建连**阶段：请求体一个字节都没发出去，重试不存在重复计费。
+    // 而一旦进入发送/等待响应阶段就不再重试（那可能已经在上游落了账）。
+    let mut attempt = 0u8;
+    loop {
+        attempt += 1;
+        let mut builder = client.post(&plan.url).body(plan.body.clone());
+        for (key, value) in &plan.headers {
+            builder = builder.header(key, value);
+        }
+        match tokio::time::timeout(budget, builder.send()).await {
+        Ok(Ok(response)) => return Ok(response),
+        Ok(Err(error)) if error.is_connect() && attempt < 2 => {
+            logging::log(
+                "[Accio]",
+                &format!("建连失败（{via}），300ms 后重试一次: {}", egress::describe_chain(&error)),
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            continue;
+        }
+        Ok(Err(error)) if error.is_timeout() => {
+            return Err(GatewayError::with_status(
+                502,
+                format!(
+                    "Accio 连接中超时({}秒，出口 {via})",
+                    crate::timeouts::current().connect_ms() / 1000
+                ),
+            ));
+        }
+        Ok(Err(error)) => {
+            return Err(GatewayError::with_status(
+                502,
+                format!("Accio 上游请求失败（{via}）: {}", egress::describe_chain(&error)),
+            ));
+        }
+        Err(_elapsed) => {
+            return Err(GatewayError::with_status(
+                502,
+                format!("Accio 等待响应超时({}秒，出口 {via})", budget.as_secs()),
+            ));
+        }
+        }
     }
 }
 

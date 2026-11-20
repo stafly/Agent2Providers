@@ -1,4 +1,4 @@
-//! Accio 协议转换：OpenAI Chat Completions ↔ 阿里 ADK 的 **Gemini 风格**信封。
+﻿//! Accio 协议转换：OpenAI Chat Completions ↔ 阿里 ADK 的 **Gemini 风格**信封。
 //!
 //! ── 两边长什么样（依据：客户端 `@ali/accio-adk-ts` 与 `gateway-worker`）──
 //! 下游（本项目内部统一形态，见 `core::protocol` 的模块头）：
@@ -260,6 +260,30 @@ fn tool_result_part(message: &Value, call_names: &std::collections::HashMap<Stri
     }})
 }
 
+/// 由请求内容派生**稳定**的 request_id（FNV-1a 64 位）。
+///
+/// 为什么不用随机 id：上游的上下文缓存以请求内容/会话为键，每次换 id 等于
+/// 每次都开新会话，缓存命中率被随机化（实测同内容请求也只有约一半命中）。
+/// 用内容哈希后：同一段历史 → 同一个 id（缓存可复用），历史一变 → 新 id
+/// （不会串话）。长度与形态仍满足上游对 `sg_k`（md5(request_id)）的要求。
+fn stable_request_id(model: &str, system: &str, contents: &[Value]) -> String {
+    fn feed(hash: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    feed(&mut hash, model.as_bytes());
+    feed(&mut hash, b"\x01");
+    feed(&mut hash, system.as_bytes());
+    for entry in contents {
+        feed(&mut hash, entry.to_string().as_bytes());
+        feed(&mut hash, b"\x01");
+    }
+    format!("a2a-{hash:016x}")
+}
+
 /// 一次请求转换的产出
 pub struct OutboundBody {
     /// 已归一的上游请求体（键名 snake_case）
@@ -390,7 +414,12 @@ pub fn build_upstream_body(
     // 客户端自己的归一化开关（桌面端每个请求都带它）
     properties.insert("normalized_response".to_string(), Value::String("true".to_string()));
 
-    let request_id = crate::ids::new_conversation_id();
+    // ── request_id 为什么按内容派生 ────────────────────────────
+    // 上游的上下文缓存按请求内容做前缀/会话关联；每次换一个随机 id，同一段
+    // 历史在它眼里就是一次全新会话（实测同一账号、同样 70 万上下文，命中率
+    // 在 0% 与 99% 之间跳）。改成按 (model, system, contents) 派生：**同一段
+    // 历史恒等，历史一变就换新**，既不牺牲重试幂等，也不再自造噪声。
+    let request_id = stable_request_id(model_code, &system_instruction, &contents);
     let mut payload = Map::new();
     payload.insert("model".to_string(), Value::String(model_code.to_string()));
     // 租户**缺省留空**：上游按 token 解析；写死 `accio-agent` 会让部分模型

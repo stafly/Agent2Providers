@@ -467,6 +467,25 @@ impl Translator {
             if let Some(telemetry) = telemetry {
                 telemetry.report_usage(usage);
             }
+            // 缓存命中这行日志是**排障锚点**：上游的上下文缓存是否命中，
+            // 只能从 usage 里的 cachedContentTokenCount 看出来。命中时通常
+            // 是 95%~99%，未命中就是 0 —— 二元分布，所以按大请求记一行即可。
+            let prompt = usage.get("prompt_tokens").and_then(Value::as_i64).unwrap_or(0);
+            let cached = usage
+                .get("prompt_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            if prompt >= 10_000 {
+                let rate = if prompt > 0 { cached as f64 / prompt as f64 * 100.0 } else { 0.0 };
+                crate::logging::log(
+                    "[Accio]",
+                    &format!(
+                        "上下文缓存 {:.1}%（cached {cached} / prompt {prompt}，模型 {}）",
+                        rate, self.model_name
+                    ),
+                );
+            }
         }
         if !frame.finish_reason.is_empty() {
             self.finish_reason = Some(super::protocol::finish_reason(&frame.finish_reason).to_string());
