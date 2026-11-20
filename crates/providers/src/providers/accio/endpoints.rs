@@ -59,6 +59,12 @@ pub const SUBSCRIPTION_PATH: &str = "/api/entitlement/currentSubscription";
 /// 与 `group` 两个字段，前者正是思考档位落点要用的（见 `models.rs`）。
 /// 因此目录刷新打 v1，`MODEL_CONFIG_PATH_V2` 只作为回落。
 pub const MODEL_CONFIG_PATH: &str = "/api/llm/config";
+/// 团队（公司空间）列表：`POST`，`accessToken` 进 body。
+///
+/// 返回 `{"success":true,"code":"200","data":[{teamId,teamName,role,status,…}]}`
+/// —— `data` 直接是数组（不是对象），见 `auth::fetch_teams` 的形状注释。
+pub const TEAMS_PATH: &str = "/api/team/queryUserTeams";
+
 /// 模型目录的精简版（旧路径）。只在 v1 意外失败时回落一次，见 `models::refresh`
 pub const MODEL_CONFIG_PATH_V2: &str = "/api/llm/config/v2";
 

@@ -157,6 +157,94 @@ pub fn apply_profile(credentials: &mut Credentials, profile: &Value) {
 /// `ensure_identity`」三步（它还要处理地区覆盖），没有经过这个便捷入口。
 /// 留着它是因为它是「一条 payload 进、一份可用凭证出」的**完整形态**，
 /// 下一处要接「从别处导入凭证」时直接用它。
+/// 查账号所属的团队（公司空间）列表。
+///
+/// ── `data` 为什么单独判（改造时踩过一次）────────────────────
+/// 信封是 `{"success":true,"code":"200","data":[{…}]}`：`data` **直接就是
+/// 数组**。先走 `unwrap_data`（它只解「`data` 是对象」那一层）会得到空 Vec，
+/// 「属于 0 个团队」这种假阴性会让自动绑定静默不生效。
+pub async fn fetch_teams(
+    credentials: &Credentials,
+    proxy: Option<&ResolvedProxy>,
+) -> Result<Vec<Value>, GatewayError> {
+    let body = json!({
+        "utdid": credentials.utdid(),
+        "version": endpoints::DEFAULT_APP_VERSION,
+        "accessToken": credentials.access_token,
+    });
+    let response = post_json(credentials.region, endpoints::TEAMS_PATH, &body, proxy).await?;
+    let payload = payload(response, "团队列表查询")?;
+    let items = match payload.get("data").and_then(Value::as_array) {
+        Some(items) => items.clone(),
+        None => {
+            let data = unwrap_data(payload);
+            data.get("list")
+                .and_then(Value::as_array)
+                .cloned()
+                .or_else(|| data.get("teams").and_then(Value::as_array).cloned())
+                .unwrap_or_default()
+        }
+    };
+    Ok(items)
+}
+
+/// 账号还没有空间时，替它认一次公司空间。
+///
+/// ── 规则：只有「恰好一个 ACTIVE 团队」才自动采纳 ─────────────
+/// 多个团队时替用户选一个就是在猜（花错池子的代价是真实的），留给他自己在
+/// 面板上改；零个团队说明是个人版账号，什么都不做。
+pub async fn adopt_single_team(credentials: &mut Credentials, proxy: Option<&ResolvedProxy>) {
+    if credentials.is_team() {
+        return;
+    }
+    let teams = match fetch_teams(credentials, proxy).await {
+        Ok(teams) => teams,
+        Err(error) => {
+            logging::verbose(
+                "[Accio]",
+                &format!("团队列表查询失败（不影响账号可用性）: {}", error.message),
+            );
+            return;
+        }
+    };
+    let active: Vec<&Value> = teams
+        .iter()
+        .filter(|team| {
+            team.get("status")
+                .and_then(Value::as_str)
+                .map(|status| status.eq_ignore_ascii_case("active"))
+                .unwrap_or(true)
+        })
+        .collect();
+    if active.len() != 1 {
+        if !active.is_empty() {
+            logging::log(
+                "[Accio]",
+                &format!("账号属于 {} 个团队，未自动绑定，请在面板上指定公司空间", active.len()),
+            );
+        }
+        return;
+    }
+    let team = active[0];
+    let id = team.get("teamId").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if id.is_empty() {
+        return;
+    }
+    let name: String = team
+        .get("teamName")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .chars()
+        .take(100)
+        .collect();
+    credentials.team_id = id;
+    credentials.team_name = name;
+    logging::log(
+        "[Accio]",
+        &format!("已自动绑定公司空间 {}（{}）", credentials.team_id, credentials.team_name),
+    );
+}
+
 #[allow(dead_code)]
 pub async fn prepare_account(payload: &Value) -> Result<Credentials, GatewayError> {
     let mut credentials = Credentials::from_payload(payload)?;

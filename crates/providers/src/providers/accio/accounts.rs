@@ -73,6 +73,8 @@ pub(super) async fn normalize(
         if let Ok(profile) = auth::fetch_profile(&credentials.access_token, region, proxy.as_ref()).await {
             auth::apply_profile(&mut credentials, &profile);
         }
+        // 恰好一个 ACTIVE 团队时自动绑定公司空间（多团队留给用户手选）
+        auth::adopt_single_team(&mut credentials, proxy.as_ref()).await;
     }
     credentials.ensure_identity();
     // `ensure_identity` 只补 device_id；user_id 仍可能为空（资料接口失败），

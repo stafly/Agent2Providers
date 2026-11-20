@@ -223,6 +223,8 @@ pub async fn exchange_code(
             &format!("登录后查资料失败（不影响落账号）: {}", error.message),
         ),
     }
+    // 新账号默认带上公司空间（恰好一个 ACTIVE 团队时），免得用户还要手填 teamId
+    auth::adopt_single_team(&mut credentials, proxy).await;
     credentials.ensure_identity();
     Ok(credentials)
 }
